@@ -336,6 +336,54 @@
           datapaths.
         </p>
       </column>
+
+      <column name="other_config" key="dpdk-hw-offload-init"
+              type='{"type": "boolean"}'>
+        <p>
+          Set this value to <code>true</code> to enable hardware acceleration
+          support for DPDK ports. The vswitch must have compile-time support
+          for DPDK as well.
+        </p>
+        <p>
+          The default value is <code>false</code>. Changing this value requires
+          restarting the daemon.
+        </p>
+        <p>
+          If this value is <code>false</code> at startup, any dpdk ports which
+          are configured in the bridge with hardware acceleration will fail.
+        </p>
+      </column>
+
+      <column name="other_config" key="dpdk-hw-offload-ids"
+              type='{"type": "string"}'>
+        <p>
+          A comma-seperated list of PCI ids, each of which represents a
+          hardware accelerated device.
+        </p>
+        <p>
+          The PCI ids in this list are used to populate the hardware
+          acceleration table <ref table="hw_offload"/>. No table will be
+          created if there are no PCI ids are provided by the user.
+        </p>
+        <p>
+          User can provide upto 8 different devices using their PCI ids.
+        </p>
+        <p>
+          Changing this list requires restarting of OVS deamon.
+        </p>
+      </column>
+      <column name="other_config" key="hw-vhost-sock-dir"
+              type='{"type": "string"}'>
+        <p>
+          Specifies the path to the vhost-user unix domain socket files used
+          by hardware acceleration. This path must exist.
+        </p>
+        <p>
+          Defaults to the working directory of the application. Changing this
+          value requires restarting the daemon.
+        </p>
+      </column>
+
     </group>
 
     <group title="Status">
@@ -5020,5 +5068,25 @@
       A mapping from SPB network Individual Service Identifier (ISID) to VLAN
       id.
     </column>
+  </table>
+  <table name="hw_offload">
+    <p>
+      Hardware switching configuration and capabilities.
+    </p>
+    <column name="name">
+      The name of hardware acceleration device.
+    </column>
+    <column name="dev_id" type='{"type": "integer", "minInteger": 0, "maxInteger": 7}'>
+      The integer device id of hardware accelerated NIC/FPGA.
+    </column>
+     <column name="pci_id" type='{"type": "string"}'>
+      The PCI ID of the hardware acceleration device.
+     </column>
+     <column name="features" key="n_vhost_ports" type='{"type": "integer"}'>
+      The number of supported vhost ports in the hardware switch.
+     </column>
+     <column name="features" key="n_phy_ports" type='{"type": "integer"}'>
+      The number of available physical ports in the hardware switch.
+     </column>
   </table>
 </database>

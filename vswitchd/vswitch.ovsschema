@@ -1,6 +1,6 @@
 {"name": "Open_vSwitch",
- "version": "7.14.0",
- "cksum": "3374030633 22987",
+ "version": "7.15.0",
+ "cksum": "2062523913 23628",
  "tables": {
    "Open_vSwitch": {
      "columns": {
@@ -621,4 +621,27 @@
                   "value": {"type": "integer",
                           "minInteger": 0,
                           "maxInteger": 4095},
-                  "min": 0, "max": "unlimited"}}}}}}
+                  "min": 0, "max": "unlimited"}}}},
+   "hw_offload": {
+     "columns": {
+       "name": {
+         "type": "string",
+         "ephemeral": true,
+         "mutable": false},
+       "dev_id": {
+         "type": {"key": {"type": "integer",
+                          "minInteger": 0,
+                          "maxInteger": 7}},
+         "ephemeral": true,
+         "mutable": false},
+       "pci_id": {
+         "type": "string",
+         "ephemeral": true,
+         "mutable": false},
+       "features": {
+         "type": {"key": "string", "value": "string", "min": 0, "max": "unlimited"},
+         "ephemeral": true,
+         "mutable": false}
+    },
+    "isRoot": true
+    }}}
