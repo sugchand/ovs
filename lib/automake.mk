@@ -372,7 +372,10 @@ endif
 if DPDK_NETDEV
 lib_libopenvswitch_la_SOURCES += \
 	lib/dpdk.c \
-	lib/netdev-dpdk.c
+	lib/netdev-dpdk.c \
+	lib/netdev-dpdk.h \
+	lib/netdev-dpdk-hw.c \
+	lib/netdev-dpdk-hw.h
 else
 lib_libopenvswitch_la_SOURCES += \
 	lib/dpdk-stub.c

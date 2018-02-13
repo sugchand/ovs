@@ -29,6 +29,7 @@
 #include "dirs.h"
 #include "dpif.h"
 #include "dpdk.h"
+#include "netdev-dpdk-hw.h"
 #include "hash.h"
 #include "openvswitch/hmap.h"
 #include "hmapx.h"
@@ -226,6 +227,8 @@ static struct if_notifier *ifnotifier;
 static struct seq *ifaces_changed;
 static uint64_t last_ifaces_changed;
 
+static void dpdk_hardware_switch_init(void);
+static void mark_dpdkhw_switch_table_writeonly(void);
 static void add_del_bridges(const struct ovsrec_open_vswitch *);
 static void bridge_run__(void);
 static void bridge_create(const struct ovsrec_bridge *);
@@ -493,6 +496,8 @@ bridge_init(const char *remote)
     ifaces_changed = seq_create();
     last_ifaces_changed = seq_read(ifaces_changed);
     ifnotifier = if_notifier_create(if_change_cb, NULL);
+    /* mark dpdkhw switch table writeable */
+    mark_dpdkhw_switch_table_writeonly();
 }
 
 void
@@ -3003,6 +3008,8 @@ bridge_run(void)
     run_stats_update();
     run_status_update();
     run_system_stats();
+    /* Initilize the DB with hardware switch details */
+    dpdk_hardware_switch_init();
 }
 
 void
@@ -4865,4 +4872,71 @@ discover_types(const struct ovsrec_open_vswitch *cfg)
     ovsrec_open_vswitch_set_iface_types(cfg, iface_types, sset_count(&types));
     free(iface_types);
     sset_destroy(&types);
+}
+
+static void
+mark_dpdkhw_switch_table_writeonly(void)
+{
+    /* The entries in the table should be marked for write */
+    ovsdb_idl_omit_alert(idl, &ovsrec_hw_offload_col_dev_id);
+    ovsdb_idl_omit_alert(idl, &ovsrec_hw_offload_col_name);
+    ovsdb_idl_omit_alert(idl, &ovsrec_hw_offload_col_pci_id);
+    ovsdb_idl_omit_alert(idl, &ovsrec_hw_offload_col_features);
+}
+
+/* Set up the hardware switch DB table */
+static void
+dpdk_hardware_switch_init(void)
+{
+    static bool hw_switch_init_ok = false;
+    static struct ovsdb_idl_txn *txn = NULL;
+    int ret;
+    int i;
+
+    if (hw_switch_init_ok) {
+        if (!txn) {
+            return;
+        }
+        ret = ovsdb_idl_txn_commit(txn);
+        if (ret != TXN_INCOMPLETE) {
+            ovsdb_idl_txn_destroy(txn);
+            txn = NULL;
+        }
+        return;
+    }
+
+    uint16_t tot_hw_switch_cnt = get_max_configured_hw_switch_cnt();
+    if (!tot_hw_switch_cnt) {
+        return;
+    }
+
+    char str[10];
+    txn = ovsdb_idl_txn_create(idl);
+    for (i = 0; i < tot_hw_switch_cnt; i++) {
+        /* hw switches have ids assigned in a sequence start from 0.
+         * ovs-vswitchd should restart to make any changes to this table.
+         */
+        struct dpdkhw_switch *hw_switch;
+        hw_switch = get_hw_switch(i);
+        if (!hw_switch) {
+            continue;
+        }
+        struct ovsrec_hw_offload *db_row;
+        db_row = ovsrec_hw_offload_insert(txn);
+        ovsrec_hw_offload_set_dev_id(db_row, hw_switch->dev_id);
+        snprintf(str, sizeof str, "%s-%u", "switch", hw_switch->dev_id);
+        ovsrec_hw_offload_set_name(db_row, str);
+        ovsrec_hw_offload_set_pci_id(db_row, hw_switch->dev_name);
+
+        /* Set up the hardware feature sets */
+        struct smap features;
+        smap_init(&features);
+        smap_add_format(&features, "n_vhost_ports", "%d",
+                        hw_switch->n_vhost_ports);
+        smap_add_format(&features, "n_phy_ports", "%d",
+                        hw_switch->n_phy_ports);
+        ovsrec_hw_offload_set_features(db_row, &features);
+    }
+    ret = ovsdb_idl_txn_commit(txn);
+    hw_switch_init_ok = true;
 }
