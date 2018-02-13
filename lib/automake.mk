@@ -375,7 +375,8 @@ lib_libopenvswitch_la_SOURCES += \
 	lib/netdev-dpdk.c \
 	lib/netdev-dpdk.h \
 	lib/netdev-dpdk-hw.c \
-	lib/netdev-dpdk-hw.h
+	lib/netdev-dpdk-hw.h \
+	lib/netdev-dpdk-hw-flow.c
 else
 lib_libopenvswitch_la_SOURCES += \
 	lib/dpdk-stub.c
