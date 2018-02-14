@@ -21,8 +21,33 @@
 
 #include <rte_config.h>
 #include <rte_lcore.h>
+#include "openvswitch/list.h"
 
 #define NON_PMD_CORE_ID LCORE_ID_ANY
+#define NUMA_NODE_0     0
+#define NUMA_NODE_1     1
+#define SOCKET0         0
+#define SOCKET1         1
+#define NIC_PORT_RX_Q_SIZE 2048  /* Size of Physical NIC RX Queue, Max (n+32<=4096)*/
+#define NIC_PORT_TX_Q_SIZE 2048  /* Size of Physical NIC TX Queue, Max (n+32<=4096)*/
+
+struct dpdk_mp {
+    struct rte_mempool *mp;
+    int mtu;
+    int socket_id;
+    int refcount;
+    struct ovs_list list_node OVS_GUARDED_BY(dpdk_mutex);
+};
+
+struct dpdk_mp *dpdk_mp_get_ext(int socket_id, int mtu);
+void dpdk_mp_put_ext(struct dpdk_mp *dmp);
+
+uint32_t dpdk_buf_size(int mtu);
+uint32_t dpdk_framelen_to_mtu(uint32_t buf_size);
+
+struct smap;
+void setup_vhost_dir(char *input, const struct smap *ovs_other_config,
+                     char **new_dir);
 
 #else
 

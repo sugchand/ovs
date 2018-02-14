@@ -961,3 +961,11 @@ dpdkhw_rte_flow_action_cleanup(struct rte_flow_item hw_flow_batch[],
     }
     return 0;
 }
+
+const struct dpdkhw_switch_fns dpdkhw_full_em_switch_fns = {
+    is_flow_ofld_on_full_em_switch_supported,
+    dpdkhw_rte_flow_xlate,
+    dpdkhw_em_action_xlate,
+    install_ovs_flow_in_hw,
+    delete_ovs_flow_in_hw
+};

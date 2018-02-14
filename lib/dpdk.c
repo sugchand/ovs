@@ -33,6 +33,7 @@
 #include "openvswitch/dynamic-string.h"
 #include "openvswitch/vlog.h"
 #include "smap.h"
+#include "netdev-dpdk-hw.h"
 
 VLOG_DEFINE_THIS_MODULE(dpdk);
 
@@ -262,6 +263,38 @@ argv_release(char **dpdk_argv, char **dpdk_argv_release, size_t dpdk_argc)
     free(dpdk_argv);
 }
 
+/* Function to configure the vhost directory for hardware/software */
+void
+setup_vhost_dir(char *input, const struct smap *ovs_other_config,
+                char **new_dir)
+{
+	char *sock_dir_subcomponent;
+    int err = 0;
+    if (process_vhost_flags(input, ovs_rundir(),
+                            NAME_MAX, ovs_other_config,
+                            &sock_dir_subcomponent)) {
+        struct stat s;
+        if (!strstr(sock_dir_subcomponent, "..")) {
+            *new_dir = xasprintf("%s/%s", ovs_rundir(),
+                                       sock_dir_subcomponent);
+
+            err = stat(*new_dir, &s);
+            if (err) {
+                VLOG_ERR("vhost-user sock directory '%s' does not exist.",
+                         *new_dir);
+            }
+        } else {
+            *new_dir = xstrdup(ovs_rundir());
+            VLOG_ERR("vhost-user sock directory request '%s/%s' has invalid"
+                     "characters '..' - using %s instead.",
+                     ovs_rundir(), sock_dir_subcomponent, ovs_rundir());
+        }
+        free(sock_dir_subcomponent);
+    } else {
+        *new_dir = sock_dir_subcomponent;
+    }
+}
+
 static void
 dpdk_init__(const struct smap *ovs_other_config)
 {
@@ -271,31 +304,8 @@ dpdk_init__(const struct smap *ovs_other_config)
     bool auto_determine = true;
     int err = 0;
     cpu_set_t cpuset;
-    char *sock_dir_subcomponent;
 
-    if (process_vhost_flags("vhost-sock-dir", ovs_rundir(),
-                            NAME_MAX, ovs_other_config,
-                            &sock_dir_subcomponent)) {
-        struct stat s;
-        if (!strstr(sock_dir_subcomponent, "..")) {
-            vhost_sock_dir = xasprintf("%s/%s", ovs_rundir(),
-                                       sock_dir_subcomponent);
-
-            err = stat(vhost_sock_dir, &s);
-            if (err) {
-                VLOG_ERR("vhost-user sock directory '%s' does not exist.",
-                         vhost_sock_dir);
-            }
-        } else {
-            vhost_sock_dir = xstrdup(ovs_rundir());
-            VLOG_ERR("vhost-user sock directory request '%s/%s' has invalid"
-                     "characters '..' - using %s instead.",
-                     ovs_rundir(), sock_dir_subcomponent, ovs_rundir());
-        }
-        free(sock_dir_subcomponent);
-    } else {
-        vhost_sock_dir = sock_dir_subcomponent;
-    }
+    setup_vhost_dir("vhost-sock-dir", ovs_other_config, &vhost_sock_dir);
 
     argv = grow_argv(&argv, 0, 1);
     argc = 1;
@@ -402,6 +412,10 @@ dpdk_init__(const struct smap *ovs_other_config)
 
     /* Finally, register the dpdk classes */
     netdev_dpdk_register();
+    if (smap_get_bool(ovs_other_config, "dpdk-hw-offload-init", false)) {
+        dpdkhw_init(ovs_other_config);
+    }
+
 }
 
 void
