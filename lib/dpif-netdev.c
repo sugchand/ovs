@@ -368,6 +368,7 @@ struct dp_netdev_flow {
     struct ovs_refcount ref_cnt;
 
     bool dead;
+    bool offloaded; /* The flow is offloaded into hw/not */
 
     /* Statistics. */
     struct dp_netdev_flow_stats stats;
@@ -2244,6 +2245,7 @@ dp_netdev_flow_add(struct dp_netdev_pmd_thread *pmd,
     memset(&flow->stats, 0, sizeof flow->stats);
     flow->dead = false;
     flow->batch = NULL;
+    flow->offloaded = false;
     *CONST_CAST(unsigned *, &flow->pmd_id) = pmd->core_id;
     *CONST_CAST(struct flow *, &flow->flow) = match->flow;
     *CONST_CAST(ovs_u128 *, &flow->ufid) = *ufid;
@@ -2295,6 +2297,23 @@ dp_netdev_flow_add(struct dp_netdev_pmd_thread *pmd,
 }
 
 static int
+dpif_netdev_hwport_flow_put(const struct dpif_class *dpif_class,
+                          enum dpif_flow_put_flags flags,
+                          struct match *match, const struct nlattr *actions,
+                          size_t actions_len, const ovs_u128 *ufid,
+                          struct dpif_flow_stats *stats)
+{
+    if (flags & DPIF_FP_CREATE || flags & DPIF_FP_MODIFY) {
+        return netdev_ports_flow_put(dpif_class, flags, match, actions,
+                                     actions_len, stats, ufid);
+    }
+    else {
+        return ENOTSUP;
+    }
+    return ENOENT;
+}
+
+static int
 flow_put_on_pmd(struct dp_netdev_pmd_thread *pmd,
                 struct netdev_flow_key *key,
                 struct match *match,
@@ -2314,7 +2333,8 @@ flow_put_on_pmd(struct dp_netdev_pmd_thread *pmd,
     if (!netdev_flow) {
         if (put->flags & DPIF_FP_CREATE) {
             if (cmap_count(&pmd->flow_table) < MAX_FLOWS) {
-                dp_netdev_flow_add(pmd, match, ufid, put->actions,
+                netdev_flow = dp_netdev_flow_add(pmd, match, ufid,
+                                   put->actions,
                                    put->actions_len);
                 error = 0;
             } else {
@@ -2359,8 +2379,21 @@ flow_put_on_pmd(struct dp_netdev_pmd_thread *pmd,
             error = EINVAL;
         }
     }
+    /* Update flows in hardware when its supported. */
+    int hw_err;
+    hw_err = dpif_netdev_hwport_flow_put(pmd->dp->class, put->flags, match,
+                                put->actions, put->actions_len, put->ufid,
+                                put->stats);
+    if (!hw_err && netdev_flow) {
+        /* It is necessary to set the flow to offloaded when the flow is
+         * installed successfully on a hardware/NIC.
+         * XXX :: The flag has to set in the new flow install thread when it
+         * is introduced.
+         */
+        netdev_flow->offloaded = true;
+    }
     ovs_mutex_unlock(&pmd->flow_mutex);
-    return error;
+    return (error & hw_err);
 }
 
 static int
@@ -2482,6 +2515,15 @@ dpif_netdev_flow_del(struct dpif *dpif, const struct dpif_flow_del *del)
                 del->stats->tcp_flags |= pmd_stats.tcp_flags;
             }
         }
+        /*
+         * XXX :: The flow can be present in both sw & hw. Sometimes it will
+         * be either in sw or hw. So lets try to delete the flow
+         * unconditionally from hardware if possible.
+         */
+        int hw_error = 0;
+        hw_error = netdev_ports_flow_del(dp->class, del->ufid, del->stats);
+        error &= hw_error;
+
     } else {
         pmd = dp_netdev_get_pmd(dp, del->pmd_id);
         if (!pmd) {
@@ -4141,6 +4183,7 @@ handle_packet_upcall(struct dp_netdev_pmd_thread *pmd, struct dp_packet *packet,
     struct match match;
     ovs_u128 ufid;
     int error;
+    int hw_flow_install_err;
 
     match.tun_md.valid = false;
     miniflow_expand(&key->mf, &match.flow);
@@ -4194,6 +4237,19 @@ handle_packet_upcall(struct dp_netdev_pmd_thread *pmd, struct dp_packet *packet,
         }
         ovs_mutex_unlock(&pmd->flow_mutex);
 
+        /* Extend the flow install into hardware if possible */
+        hw_flow_install_err = dpif_netdev_hwport_flow_put(pmd->dp->class,
+                                        DPIF_FP_CREATE, &match,
+                                        add_actions->data, add_actions->size,
+                                         &ufid, NULL /*stats */);
+        if (!hw_flow_install_err) {
+            /* If flow install is successful in hardware. Mark the sw flow
+             * as 'offloaded'.
+             * XXX :: The new flow thread has to do this in future when a
+             * flow install is complete.
+             */
+             netdev_flow->offloaded = true;
+        }
         emc_insert(&pmd->flow_cache, key, netdev_flow);
     }
 }
@@ -4289,6 +4345,28 @@ fast_path_processing(struct dp_netdev_pmd_thread *pmd,
         flow = dp_netdev_flow_cast(rules[i]);
 
         emc_insert(flow_cache, &keys[i], flow);
+
+        /* Extend the emc flow installation into hardware if possible */
+        int hw_flow_install_err;
+        struct dp_netdev_actions *actions;
+        struct match match = {
+                                .flow = flow->flow,
+                                .tun_md.valid = false
+                             };
+        actions = dp_netdev_flow_get_actions(flow);
+        hw_flow_install_err = dpif_netdev_hwport_flow_put(pmd->dp->class,
+                                        DPIF_FP_CREATE, &match,
+                                        actions->actions, actions->size,
+                                         &flow->ufid, NULL /*stats */);
+        if (!hw_flow_install_err) {
+            /* If flow install is successful in hardware. Mark the sw flow
+             * as 'offloaded'.
+             * XXX :: The new flow thread has to do this in future when a
+             * flow install is complete.
+             */
+             flow->offloaded = true;
+        }
+
         dp_netdev_queue_batches(packet, flow, &keys[i].mf, batches, n_batches);
     }
 
