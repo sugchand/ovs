@@ -76,6 +76,8 @@
 #include "tnl-ports.h"
 #include "unixctl.h"
 #include "util.h"
+#include "netdev-provider.h"
+#include "netdev-dpdk-hw.h"
 
 VLOG_DEFINE_THIS_MODULE(dpif_netdev);
 
@@ -1325,6 +1327,15 @@ out:
     return error;
 }
 
+static void
+answer_port_query(const struct dp_netdev_port *port,
+                  struct dpif_port *dpif_port)
+{
+    dpif_port->name = xstrdup(netdev_get_name(port->netdev));
+    dpif_port->type = xstrdup(port->type);
+    dpif_port->port_no = port->port_no;
+}
+
 static int
 do_add_port(struct dp_netdev *dp, const char *devname, const char *type,
             odp_port_t port_no)
@@ -1341,6 +1352,14 @@ do_add_port(struct dp_netdev *dp, const char *devname, const char *type,
     error = port_create(devname, type, port_no, &port);
     if (error) {
         return error;
+    }
+
+    /* Add port to netdev hashmap if hardware acceleration is used */
+    if (is_dpdkhw_port(port->netdev)) {
+        struct dpif_port dpif_port;
+        VLOG_INFO("Adding HW port to hash mash");
+        answer_port_query(port, &dpif_port);
+        netdev_ports_insert(port->netdev, dp->class, &dpif_port);
     }
 
     hmap_insert(&dp->ports, &port->node, hash_port_no(port_no));
@@ -1500,16 +1519,8 @@ do_del_port(struct dp_netdev *dp, struct dp_netdev_port *port)
 
     reconfigure_datapath(dp);
 
+    netdev_ports_remove(port->port_no, dp->class);
     port_destroy(port);
-}
-
-static void
-answer_port_query(const struct dp_netdev_port *port,
-                  struct dpif_port *dpif_port)
-{
-    dpif_port->name = xstrdup(netdev_get_name(port->netdev));
-    dpif_port->type = xstrdup(port->type);
-    dpif_port->port_no = port->port_no;
 }
 
 static int
