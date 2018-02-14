@@ -2852,6 +2852,7 @@ netdev_linux_update_flags(struct netdev *netdev_, enum netdev_flags off,
     netdev_linux_rxq_recv,                                      \
     netdev_linux_rxq_wait,                                      \
     netdev_linux_rxq_drain,                                     \
+    NO_OFFLOAD_API                                              \
 }
 
 const struct netdev_class netdev_linux_class =

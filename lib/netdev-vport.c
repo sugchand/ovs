@@ -838,8 +838,8 @@ get_stats(const struct netdev *netdev, struct netdev_stats *stats)
     NULL,                   /* rx_dealloc */                \
     NULL,                   /* rx_recv */                   \
     NULL,                   /* rx_wait */                   \
-    NULL,                   /* rx_drain */
-
+    NULL,                   /* rx_drain */                  \
+    NO_OFFLOAD_API          /* offload flow fns */
 
 #define TUNNEL_CLASS(NAME, DPIF_PORT, BUILD_HEADER, PUSH_HEADER, POP_HEADER)   \
     { DPIF_PORT,                                                               \

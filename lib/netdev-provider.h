@@ -115,6 +115,13 @@ struct netdev_rxq {
 
 struct netdev *netdev_rxq_get_netdev(const struct netdev_rxq *);
 
+struct netdev_flow_dump {
+    struct netdev *netdev;
+    odp_port_t port;
+    struct nl_dump *nl_dump;
+    bool terse;
+};
+
 /* Network device class structure, to be defined by each implementation of a
  * network device.
  *
@@ -769,6 +776,51 @@ struct netdev_class {
 
     /* Discards all packets waiting to be received from 'rx'. */
     int (*rxq_drain)(struct netdev_rxq *rx);
+
+    /* ## -------------------------------- ## */
+    /* ## netdev flow offloading functions ## */
+    /* ## -------------------------------- ## */
+
+    /* If a particular netdev class does not support offloading flows, all these
+     * function pointers must be NULL. */
+
+    /* Deleting all offloaded flows from netdev */
+    int (*flow_flush)(struct netdev *);
+    /* Dumping interface:
+     * Usage is as with dpif_port_dump api (create, next, destory).
+     * Create sets dump on success or returns error status on failure. */
+    int (*flow_dump_create)(struct netdev *, struct netdev_flow_dump **dump);
+    int (*flow_dump_destroy)(struct netdev_flow_dump *);
+    /* rbuffer is for use of the implementation (e.g using nl_dump),
+     * and is usually shared for the given thread that runs flow_dump_next.
+     * wbuffer is the buffer that dumped actions will be stored in, and given
+     * pointers to. */
+    bool (*flow_dump_next)(struct netdev_flow_dump *, struct match *,
+                           struct nlattr **actions,
+                           size_t *action_len,
+                           struct dpif_flow_stats *stats, ovs_u128 *ufid,
+                           struct ofpbuf *rbuffer, struct ofpbuf *wbuffer);
+
+    /* Offload the given flow (match, actions, stats, ufid) on netdev.
+     * If stats isn't null, sets the given stats for that flow.
+     * To modify the flow, use the same ufid.
+     * actions are in netlink format, as with struct dpif_flow_put.
+     * info is anything else that is need to offload the flow. */
+    int (*flow_put)(struct netdev *, struct match *, const struct nlattr *actions,
+                    size_t actions_len, struct dpif_flow_stats *,
+                    const ovs_u128 *ufid, struct offload_info *info);
+    /* Queries the flow with specified ufid on netdev.
+     * Fills match, actions, stats as with flow_dump_next */
+    int (*flow_get)(struct netdev *, struct match *, struct nlattr **actions,
+                    size_t *action_len,
+                    struct dpif_flow_stats *, const ovs_u128 *ufid,
+                    struct ofpbuf *);
+    /* Deletes the given flow specified by ufid from netdev.
+     * If stats is not null, fills it with flow stats. */
+    int (*flow_del)(struct netdev *, struct dpif_flow_stats *,
+                    const ovs_u128 *ufid);
+    /* Initializies the netdev flow api. */
+    int (*init_flow_api)(struct netdev *);
 };
 
 int netdev_register_provider(const struct netdev_class *);
@@ -787,5 +839,7 @@ extern const struct netdev_class netdev_tap_class;
 #ifdef  __cplusplus
 }
 #endif
+
+#define NO_OFFLOAD_API NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
 
 #endif /* netdev.h */
