@@ -2086,6 +2086,7 @@ dp_netdev_flow_to_dpif_flow(const struct dp_netdev_flow *netdev_flow,
     flow->ufid = netdev_flow->ufid;
     flow->ufid_present = true;
     flow->pmd_id = netdev_flow->pmd_id;
+    flow->offloaded = false;
     get_dpif_flow_stats(netdev_flow, &flow->stats);
 }
 
@@ -2160,6 +2161,60 @@ dpif_netdev_flow_from_nlattrs(const struct nlattr *key, uint32_t key_len,
 }
 
 static int
+netdev_flow_to_dpif_flow(struct match *match,
+                         struct ofpbuf *key_buf,
+                         struct ofpbuf *mask_buf,
+                         struct nlattr *actions,
+                         size_t act_len,
+                         struct dpif_flow_stats *stats,
+                         const ovs_u128 *ufid,
+                         struct dpif_flow *flow,
+                         bool terse OVS_UNUSED)
+{
+    if (terse) {
+        memset(flow, 0, sizeof *flow);
+    }
+    else {
+        struct odp_flow_key_parms odp_parms = {
+            .flow = &match->flow,
+            .mask = &match->wc.masks,
+            .support = { 0 },
+        };
+        size_t offset;
+
+        memset(flow, 0, sizeof *flow);
+
+        /* Key */
+        offset = key_buf->size;
+        flow->key = ofpbuf_tail(key_buf);
+        odp_flow_key_from_flow(&odp_parms, key_buf);
+        flow->key_len = key_buf->size - offset;
+
+        /* Mask */
+        offset = mask_buf->size;
+        flow->mask = ofpbuf_tail(mask_buf);
+        odp_parms.key_buf = key_buf;
+        odp_flow_key_from_mask(&odp_parms, mask_buf);
+        flow->mask_len = mask_buf->size - offset;
+
+        /* Actions */
+        flow->actions = actions;
+        flow->actions_len = act_len;
+    }
+
+    /* Stats */
+    memcpy(&flow->stats, stats, sizeof *stats);
+
+    /* UFID */
+    flow->ufid = *ufid;
+    flow->ufid_present = true;
+
+    flow->pmd_id = PMD_ID_NULL;
+    flow->offloaded = true; /* netdev flows are offloaded flows */
+    return 0;
+}
+
+static int
 dpif_netdev_flow_get(const struct dpif *dpif, const struct dpif_flow_get *get)
 {
     struct dp_netdev *dp = get_dp_netdev(dpif);
@@ -2184,6 +2239,21 @@ dpif_netdev_flow_get(const struct dpif *dpif, const struct dpif_flow_get *get)
     }
 
     if (!hmapx_count(&to_find)) {
+        goto out;
+    }
+
+    /* Read the flows that installed in hardware if present */
+    struct match match;
+    struct nlattr *actions;
+    size_t act_len = 0;
+    struct dpif_flow_stats stats;
+    if (!netdev_ports_flow_get(dpif->dpif_class, &match, &actions, &act_len,
+                                get->ufid, &stats, NULL)) {
+        /* Flow found in hardware, */
+        netdev_flow_to_dpif_flow(&match, get->buffer, get->buffer, actions,
+                                 act_len, &stats, get->ufid, get->flow,
+                                 0 /* terse */);
+        error = 0;
         goto out;
     }
 
@@ -2473,12 +2543,20 @@ flow_del_on_pmd(struct dp_netdev_pmd_thread *pmd,
     ovs_mutex_lock(&pmd->flow_mutex);
     netdev_flow = dp_netdev_pmd_find_flow(pmd, del->ufid, del->key,
                                           del->key_len);
+
+    /* Sometimes the flow is present in SW and HW, the flow dump collects
+     * same flow twice from SW and HW. In the first sweep the flow is being
+     * deleted from sw.
+     * Eventually in the following sweep phases the flow is being deleted
+     * from hardware too.
+     */
     if (netdev_flow) {
         if (stats) {
             get_dpif_flow_stats(netdev_flow, stats);
         }
         dp_netdev_pmd_remove_flow(pmd, netdev_flow);
-    } else {
+    }
+    else {
         error = ENOENT;
     }
     ovs_mutex_unlock(&pmd->flow_mutex);
@@ -2537,12 +2615,27 @@ dpif_netdev_flow_del(struct dpif *dpif, const struct dpif_flow_del *del)
     return error;
 }
 
+enum {
+    DUMP_OVS_FLOWS_BIT       = 0,
+    DUMP_OFFLOADED_FLOWS_BIT = 1,
+};
+
+enum {
+    DUMP_OVS_FLOWS       = (1 << DUMP_OVS_FLOWS_BIT),
+    DUMP_OFFLOADED_FLOWS = (1 << DUMP_OFFLOADED_FLOWS_BIT),
+};
+
 struct dpif_netdev_flow_dump {
     struct dpif_flow_dump up;
     struct cmap_position poll_thread_pos;
     struct cmap_position flow_pos;
     struct dp_netdev_pmd_thread *cur_pmd;
     int status;
+    struct dpdk_netdev_flow_dump **netdev_dumps;
+    int netdev_dumps_num;                    /* Number of netdev_flow_dumps */
+    struct ovs_mutex netdev_lock;            /* Guards the following. */
+    int netdev_current_dump OVS_GUARDED;     /* Shared current dump */
+    int type;
     struct ovs_mutex mutex;
 };
 
@@ -2552,14 +2645,45 @@ dpif_netdev_flow_dump_cast(struct dpif_flow_dump *dump)
     return CONTAINER_OF(dump, struct dpif_netdev_flow_dump, up);
 }
 
+static void
+start_netdev_dump(const struct dpif *dpif_,
+                  struct dpif_netdev_flow_dump *dump)
+{
+    ovs_mutex_init(&dump->netdev_lock);
+    ovs_mutex_lock(&dump->netdev_lock);
+    dump->netdev_current_dump = 0;
+    dump->netdev_dumps_num = 0;
+    dump->netdev_dumps = NULL;
+    dump->netdev_dumps = (struct dpdk_netdev_flow_dump **)
+            netdev_ports_flow_dump_create(dpif_->dpif_class,
+                                          &dump->netdev_dumps_num);
+    ovs_mutex_unlock(&dump->netdev_lock);
+}
+
+static int
+dpif_netdev_get_dump_type(char *str) {
+    int type = 0;
+
+    if (!str || !strcmp(str, "ovs") || !strcmp(str, "dpctl")) {
+        type |= DUMP_OVS_FLOWS;
+    }
+    if ((netdev_is_flow_api_enabled() && !str)
+        || (str && (!strcmp(str, "offloaded") || !strcmp(str, "dpctl")))) {
+        type |= DUMP_OFFLOADED_FLOWS;
+    }
+    return type;
+}
+
 static struct dpif_flow_dump *
-dpif_netdev_flow_dump_create(const struct dpif *dpif_, bool terse)
+dpif_netdev_flow_dump_create(const struct dpif *dpif_, bool terse, char *type)
 {
     struct dpif_netdev_flow_dump *dump;
 
     dump = xzalloc(sizeof *dump);
     dpif_flow_dump_init(&dump->up, dpif_);
     dump->up.terse = terse;
+    dump->type = dpif_netdev_get_dump_type(type);
+    start_netdev_dump(dpif_, dump);
     ovs_mutex_init(&dump->mutex);
 
     return &dump->up;
@@ -2609,6 +2733,27 @@ dpif_netdev_flow_dump_thread_destroy(struct dpif_flow_dump_thread *thread_)
     free(thread);
 }
 
+/* Increment the flow_dump counter if possible.
+ * Return 0 on success
+ * Return error otherwise
+ */
+static bool
+dpif_incr_netdev_flow_dump(struct dpif_netdev_flow_dump_thread *thread)
+{
+    bool ret = 0;
+    struct dpif_netdev_flow_dump *dump = thread->dump;
+    ovs_mutex_lock(&dump->netdev_lock);
+     dump->netdev_current_dump++;
+    if (dump->netdev_current_dump < dump->netdev_dumps_num) {
+        ret = 0;
+    }
+    else {
+        ret = 1;
+    }
+    ovs_mutex_unlock(&dump->netdev_lock);
+    return ret;
+}
+
 static int
 dpif_netdev_flow_dump_next(struct dpif_flow_dump_thread *thread_,
                            struct dpif_flow *flows, int max_flows)
@@ -2618,6 +2763,7 @@ dpif_netdev_flow_dump_next(struct dpif_flow_dump_thread *thread_,
     struct dpif_netdev_flow_dump *dump = thread->dump;
     struct dp_netdev_flow *netdev_flows[FLOW_DUMP_MAX_BATCH];
     int n_flows = 0;
+    int hw_flow_cnt = 0;
     int i;
 
     ovs_mutex_lock(&dump->mutex);
@@ -2626,6 +2772,58 @@ dpif_netdev_flow_dump_next(struct dpif_flow_dump_thread *thread_,
         struct dp_netdev *dp = get_dp_netdev(&dpif->dpif);
         struct dp_netdev_pmd_thread *pmd = dump->cur_pmd;
         int flow_limit = MIN(max_flows, FLOW_DUMP_MAX_BATCH);
+        bool has_next;
+        int cur_netdev_dump;
+
+        /* First dump the flows from hardware if its  exists */
+        do {
+            struct match match;
+            struct nlattr *actions;
+            size_t act_len;
+            struct dpif_flow_stats stats;
+            ovs_u128 ufid;
+
+            cur_netdev_dump = dump->netdev_current_dump;
+            if (!dump->netdev_dumps) {
+                break;
+            }
+            if (dump->type && !(dump->type & DUMP_OFFLOADED_FLOWS)) {
+                /* No need to dump offloaded flows */
+                break;
+            }
+            struct dpdk_netdev_flow_dump *netdev_dump =
+                                dump->netdev_dumps[cur_netdev_dump];
+            if ((cur_netdev_dump < dump->netdev_dumps_num) && netdev_dump) {
+                has_next = netdev_flow_dump_next(&netdev_dump->dump, &match,
+                                             &actions, &act_len, &stats, &ufid,
+                                             NULL, NULL);
+                if (has_next) {
+                     struct odputil_keybuf *maskbuf = &thread->maskbuf[n_flows];
+                     struct odputil_keybuf *keybuf = &thread->keybuf[n_flows];
+                     struct dpif_flow *f = &flows[n_flows];
+                     struct ofpbuf key, mask;
+                     ofpbuf_use_stack(&key, keybuf, sizeof *keybuf);
+                     ofpbuf_use_stack(&mask, maskbuf, sizeof *maskbuf);
+                     netdev_flow_to_dpif_flow(&match, &key, &mask, actions,
+                                             act_len, &stats, &ufid, f,
+                                             dump->up.terse);
+                     n_flows++;
+                }
+            }
+            if (!netdev_dump || !has_next) {
+                /* Dump flows from next netdev */
+                if (dpif_incr_netdev_flow_dump(thread)) {
+                    /* Cannot increment, exit the loop */
+                    break;
+                }
+            }
+        } while (n_flows < flow_limit);
+
+        if (n_flows == flow_limit) {
+            /* Max limit reached, return the flow dump */
+            ovs_mutex_unlock(&dump->mutex);
+            goto out;
+        }
 
         /* First call to dump_next(), extracts the first pmd thread.
          * If there is no pmd thread, returns immediately. */
@@ -2638,8 +2836,15 @@ dpif_netdev_flow_dump_next(struct dpif_flow_dump_thread *thread_,
             }
         }
 
+        hw_flow_cnt = n_flows;
+        if (dump->type && !(dump->type & DUMP_OVS_FLOWS)) {
+            /* No need to dump software flows */
+            ovs_mutex_unlock(&dump->mutex);
+            goto out;
+        }
+
         do {
-            for (n_flows = 0; n_flows < flow_limit; n_flows++) {
+            while (n_flows < flow_limit) {
                 struct cmap_node *node;
 
                 node = cmap_next_position(&pmd->flow_table, &dump->flow_pos);
@@ -2649,6 +2854,7 @@ dpif_netdev_flow_dump_next(struct dpif_flow_dump_thread *thread_,
                 netdev_flows[n_flows] = CONTAINER_OF(node,
                                                      struct dp_netdev_flow,
                                                      node);
+                n_flows++;
             }
             /* When finishing dumping the current pmd thread, moves to
              * the next. */
@@ -2667,11 +2873,11 @@ dpif_netdev_flow_dump_next(struct dpif_flow_dump_thread *thread_,
             /* If the current dump is empty, do not exit the loop, since the
              * remaining pmds could have flows to be dumped.  Just dumps again
              * on the new 'pmd'. */
-        } while (!n_flows);
+        } while (n_flows == hw_flow_cnt);
     }
     ovs_mutex_unlock(&dump->mutex);
 
-    for (i = 0; i < n_flows; i++) {
+    for (i = hw_flow_cnt; i < n_flows; i++) {
         struct odputil_keybuf *maskbuf = &thread->maskbuf[i];
         struct odputil_keybuf *keybuf = &thread->keybuf[i];
         struct dp_netdev_flow *netdev_flow = netdev_flows[i];
@@ -2684,6 +2890,7 @@ dpif_netdev_flow_dump_next(struct dpif_flow_dump_thread *thread_,
                                     dump->up.terse);
     }
 
+out:
     return n_flows;
 }
 

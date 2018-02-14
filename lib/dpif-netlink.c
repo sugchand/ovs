@@ -1379,7 +1379,7 @@ dpif_netlink_flow_dump_cast(struct dpif_flow_dump *dump)
 }
 
 static struct dpif_flow_dump *
-dpif_netlink_flow_dump_create(const struct dpif *dpif_, bool terse)
+dpif_netlink_flow_dump_create(const struct dpif *dpif_, bool terse, char *type)
 {
     const struct dpif_netlink *dpif = dpif_netlink_cast(dpif_);
     struct dpif_netlink_flow_dump *dump;
