@@ -148,6 +148,209 @@ ntoh_mac(struct eth_addr *src, struct eth_addr *dst)
     }
 }
 
+/* Function to go through each actions to see if it can handle with in the
+ * same device. Also look at the actions to see if its supported in the hw.
+ */
+static bool
+is_action_hanlded_in_one_device(struct dpdkhw_switch *hw_switch,
+                                const struct nlattr *actions,
+                                size_t actions_len,
+                                struct offload_info *ofld_info)
+{
+    const struct nlattr *a;
+    unsigned int left;
+
+    NL_ATTR_FOR_EACH_UNSAFE (a, left, actions, actions_len) {
+        int type = nl_attr_type(a);
+        switch ((enum ovs_action_attr) type) {
+        case OVS_ACTION_ATTR_OUTPUT: {
+            odp_port_t out_port = nl_attr_get_odp_port(a);
+            /* Output port should be hardware port number. */
+            struct netdev *netdev = get_hw_netdev(out_port,
+                                                  ofld_info->port_hmap_obj);
+            if (!netdev) {
+                VLOG_WARN("Cannot find the output port in hw-accel list"
+                          " port %u", odp_to_u32(out_port));
+                return false;
+            }
+            if (!is_netdev_on_switch(netdev, hw_switch->dev_id)) {
+                VLOG_DBG("Output action is not on same device."
+                         "inport device %u ", hw_switch->dev_id);
+                return false;
+            }
+            break;
+            }
+        case OVS_ACTION_ATTR_PUSH_VLAN:
+        case OVS_ACTION_ATTR_POP_VLAN:
+        case OVS_ACTION_ATTR_SET:
+        case OVS_ACTION_ATTR_PUSH_MPLS:
+        case OVS_ACTION_ATTR_POP_MPLS:
+        case OVS_ACTION_ATTR_TUNNEL_PUSH:
+        case OVS_ACTION_ATTR_TUNNEL_POP:
+        case OVS_ACTION_ATTR_SET_MASKED:
+        case OVS_ACTION_ATTR_SAMPLE:
+        case OVS_ACTION_ATTR_HASH:
+        case OVS_ACTION_ATTR_UNSPEC:
+        case OVS_ACTION_ATTR_TRUNC:
+        case OVS_ACTION_ATTR_USERSPACE:
+        case OVS_ACTION_ATTR_RECIRC:
+        case OVS_ACTION_ATTR_CT:
+        case __OVS_ACTION_ATTR_MAX: {
+            break;
+            }
+        default: {
+            break;
+            }
+        }
+        /* TODO :: Validate each actions */
+    }
+    return true;
+}
+
+static bool
+is_hw_switch_support_proto(struct dpdkhw_switch *hw_switch,
+                           enum hw_switch_proto switch_proto)
+{
+    if (switch_proto >= LAST_PROTO_INVALID) {
+        VLOG_DBG("Invalid protocol, cannot find in hardware capabilities");
+        return false;
+    }
+    uint8_t flag = 1 << (switch_proto % 8);
+    if (hw_switch->avail_ptypes[switch_proto/8] & flag) {
+        return true;
+    }
+    return false;
+}
+
+static bool
+is_protocol_supported_in_hw(struct dpdkhw_switch *hw_switch,
+                            struct match *match)
+{
+    struct flow *flow = &match->flow;
+    /* Start from the upper layer protocols, L4 layer protocols*/
+    switch(flow->nw_proto) {
+    case IPPROTO_TCP: {
+        return is_hw_switch_support_proto(hw_switch, L4_TCP);
+        break;
+        }
+    case IPPROTO_UDP: {
+        return is_hw_switch_support_proto(hw_switch, L4_UDP);
+        break;
+        }
+    case IPPROTO_ICMP: {
+        return is_hw_switch_support_proto(hw_switch, L4_ICMP);
+        break;
+        }
+    case IPPROTO_SCTP: {
+        return is_hw_switch_support_proto(hw_switch, L4_SCTP);
+        break;
+        }
+    case IPPROTO_ICMPV6: {
+        return is_hw_switch_support_proto(hw_switch, L4_ICMPV6);
+        break;
+        }
+    }
+
+    /* Look for L3 only layer protocols */
+    switch(ntohs(flow->dl_type)) {
+    case ETH_TYPE_ARP: {
+        return is_hw_switch_support_proto(hw_switch, L3_ARP);
+        break;
+        }
+    case ETH_TYPE_RARP: {
+        return is_hw_switch_support_proto(hw_switch, L3_RARP);
+        break;
+        }
+    case ETH_TYPE_IP: {
+        return is_hw_switch_support_proto(hw_switch, L3_IP);
+        break;
+        }
+    case ETH_TYPE_IPV6: {
+        return is_hw_switch_support_proto(hw_switch, L3_IPV6);
+        break;
+        }
+    case ETH_TYPE_VLAN: {
+        return is_hw_switch_support_proto(hw_switch, L3_VLAN);
+        break;
+        }
+    }
+
+    if (!eth_addr_is_zero(flow->dl_dst) && !eth_addr_is_zero(flow->dl_src)) {
+        /* Just a L2 rule */
+        return is_hw_switch_support_proto(hw_switch, L2_ETH);
+    }
+
+    /* TODO :: Add protocols to check support */
+    return false;
+}
+
+static bool
+is_flow_ofld_on_full_wc_switch_supported(struct netdev *netdev,
+                                         struct dpdkhw_switch *hw_switch,
+                                         struct match *match,
+                                         const struct nlattr *actions,
+                                         size_t actions_len,
+                                         const ovs_u128 *ufid,
+                                         struct offload_info *info)
+{
+    /* Check if the flow count before the install */
+    if (atomic_count_get(&hw_switch->n_flow_cnt) >=
+        hw_switch->total_flow_cnt) {
+        return false;
+    }
+
+    /* Check if flow types are supported in the switch */
+    if (!is_protocol_supported_in_hw(hw_switch, match)) {
+        return false;
+    }
+
+    /* It is not necessary to install all exact match flows into hardware when
+     * hardware can do wild card flow match. OVS trigger the flow install for
+     * every EMC insert. Ignore the flow install when flow is present already.
+     */
+    if (info->flow_flags & DPIF_FP_CREATE &&
+        get_ufid_to_rteflow_mapping(ufid, netdev)) {
+        return false;
+    }
+
+    /* Check if the actions has port output, make sure its in same device */
+    return is_action_hanlded_in_one_device(hw_switch, actions,
+                                           actions_len, info);
+}
+
+static bool
+is_flow_ofld_on_full_em_switch_supported(struct netdev *netdev,
+                                         struct dpdkhw_switch *hw_switch,
+                                         struct match *match,
+                                         const struct nlattr *actions,
+                                         size_t actions_len,
+                                         const ovs_u128 *ufid,
+                                         struct offload_info *info)
+{
+    int ret = 0;
+    /* hardware doesnt have flow modify support, hence first delete the flow
+     * before trying the flow install.
+     */
+    if (info->flow_flags & DPIF_FP_MODIFY) {
+        netdev_dpdkhw_switch_flow_del(netdev, hw_switch, ufid);
+    }
+
+    /* Check if the flow count before the install */
+    if (atomic_count_get(&hw_switch->n_flow_cnt) >=
+        hw_switch->total_flow_cnt) {
+        return false;
+    }
+
+    /* Check if flow types are supported in the switch */
+    if (!is_protocol_supported_in_hw(hw_switch, match)) {
+        return false;
+    }
+
+    /* Check if the actions has port output, make sure its in same device */
+    return is_action_hanlded_in_one_device(hw_switch, actions,
+                                           actions_len, info);
+}
+
 static enum xlate_status
 do_inport_flow_xlate(struct match *match, struct rte_flow_batch *batch,
                                           const void *md)
@@ -960,6 +1163,76 @@ dpdkhw_rte_flow_action_cleanup(struct rte_flow_item hw_flow_batch[],
         }
     }
     return 0;
+}
+
+static void
+update_hw_switch_on_flowadd(struct dpdkhw_switch *hw_switch)
+{
+    atomic_count_inc(&hw_switch->n_flow_cnt);
+}
+
+static void
+update_hw_switch_on_flowdel(struct dpdkhw_switch *hw_switch)
+{
+    atomic_count_dec(&hw_switch->n_flow_cnt);
+}
+
+static struct rte_flow *
+install_ovs_flow_in_hw(struct netdev *netdev, struct dpdkhw_switch *hw_switch,
+                       const struct rte_flow_attr *hw_flow_attr,
+                       struct rte_flow_item *hw_flow_batch,
+                       struct rte_flow_action *hw_action_batch,
+                       struct rte_flow_error *hw_err)
+{
+    uint16_t dpdk_portno = netdev_get_dpdk_portno(netdev);
+    struct rte_flow *hw_flow = rte_flow_create(dpdk_portno, hw_flow_attr,
+                                               hw_flow_batch, hw_action_batch,
+                                               hw_err);
+    dpdkhw_rte_flow_action_cleanup(hw_flow_batch, hw_action_batch);
+    if (hw_err->type != RTE_FLOW_ERROR_TYPE_NONE) {
+        /* Error while installing the flow */
+        VLOG_INFO("Failed to install a flow(error : %u)", hw_err->type);
+        hw_flow = NULL;
+    }
+    if (hw_flow) {
+        /* update the hardware switch only when flow is installed */
+        update_hw_switch_on_flowadd(hw_switch);
+    }
+    return hw_flow;
+}
+
+/* Delete all the flows that are corresponds to single ufid. */
+static int
+netdev_del_rte_flow(struct ufid_to_rteflow *entry, uint16_t dpdk_portno,
+                    struct dpdkhw_switch *hw_switch)
+{
+    int i;
+    int ret = 0;
+    for (i = 0; i < entry->hw_flow_size_used; i++) {
+        struct rte_flow_error rte_flow_err;
+        int res;
+        res = rte_flow_destroy(dpdk_portno, entry->hw_flows[i],
+                                &rte_flow_err);
+        if (!res) {
+            update_hw_switch_on_flowdel(hw_switch);
+        }
+        ret |= res;
+    }
+    return ret;
+}
+
+static int
+delete_ovs_flow_in_hw(struct netdev *netdev, struct dpdkhw_switch *hw_switch,
+                      const ovs_u128 *ufid)
+{
+    struct ufid_to_rteflow *entry;
+    int ret = -ENOENT;
+    entry = get_ufid_to_rteflow_mapping(ufid, netdev);
+    if (entry) {
+        uint16_t dpdk_portno = netdev_get_dpdk_portno(netdev);
+        ret = netdev_del_rte_flow(entry, dpdk_portno, hw_switch);
+    }
+    return ret;
 }
 
 const struct dpdkhw_switch_fns dpdkhw_full_em_switch_fns = {
