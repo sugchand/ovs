@@ -48,6 +48,7 @@
 #include "fatal-signal.h"
 #include "netdev-provider.h"
 #include "netdev-vport.h"
+#include "netdev-dpdk-hw-flow.h"
 #include "odp-util.h"
 #include "openvswitch/dynamic-string.h"
 #include "openvswitch/list.h"
@@ -484,7 +485,27 @@ struct netdev_dpdk {
         int rte_xstats_ids_size;
         uint64_t *rte_xstats_ids;
     );
+
+    /* Flow map cache to store hardware flow entries */
+    struct ovs_mutex dpdkhw_flow_mutex;
+    struct hmap ufid_to_flow_map OVS_GUARDED_BY(dpdkhw_flow_mutex);
+    uint16_t dev_id; /* unique id when multiple switch domain exists */
 };
+
+#define MAX_HW_OFFLOAD_SWITCH_DEVICES 8
+struct hw_switches {
+    uint16_t num_devs; /* Number of hardware acceleration devices */
+    struct dpdkhw_switch dpdkhw_switch[MAX_HW_OFFLOAD_SWITCH_DEVICES];
+};
+static struct hw_switches hw_switches;
+struct dpdkhw_switch *get_hw_switch(uint16_t dev_id);
+
+static void delete_all_ufid_to_rteflow_mapping(struct netdev_dpdk *dev)
+                                OVS_REQUIRES(dev->dpdkhw_flow_mutex);
+static bool del_ufid_to_rteflow_mapping(const ovs_u128 *ufid,
+                            struct netdev_dpdk *dev)
+                            OVS_REQUIRES(dev->dpdkhw_flow_mutex);
+
 
 struct netdev_rxq_dpdk {
     struct netdev_rxq up;
@@ -1344,6 +1365,7 @@ netdev_dpdk_destruct(struct netdev *netdev)
     netdev_dpdk_clear_xstats(dev);
     free(dev->devargs);
     common_destruct(dev);
+    hmap_destroy(&dev->ufid_to_flow_map);
 
     ovs_mutex_unlock(&dpdk_mutex);
 }
@@ -3861,6 +3883,10 @@ netdev_dpdk_reconfigure(struct netdev *netdev)
     rte_eth_dev_stop(dev->port_id);
     dev->started = false;
 
+    /* Initialize the hardware flow to ufid mapping */
+    delete_all_ufid_to_rteflow_mapping(dev);
+    hmap_destroy(&dev->ufid_to_flow_map);
+    hmap_init(&dev->ufid_to_flow_map);
     err = netdev_dpdk_mempool_configure(dev);
     if (err && err != EEXIST) {
         goto out;
@@ -4729,8 +4755,8 @@ netdev_dpdk_flow_del(struct netdev *netdev, const ovs_u128 *ufid,
 
 #define NETDEV_DPDK_CLASS(NAME, INIT, CONSTRUCT, DESTRUCT,    \
                           SET_CONFIG, SET_TX_MULTIQ, SEND,    \
-                          GET_CARRIER, GET_STATS,			  \
-                          GET_CUSTOM_STATS,					  \
+                          GET_CARRIER, GET_STATS,             \
+                          GET_CUSTOM_STATS,                   \
                           GET_FEATURES, GET_STATUS,           \
                           RECONFIGURE, RXQ_RECV)              \
 {                                                             \
@@ -4765,7 +4791,7 @@ netdev_dpdk_flow_del(struct netdev *netdev, const ovs_u128 *ufid,
     netdev_dpdk_get_carrier_resets,                           \
     netdev_dpdk_set_miimon,                                   \
     GET_STATS,                                                \
-    GET_CUSTOM_STATS,										  \
+    GET_CUSTOM_STATS,                                         \
     GET_FEATURES,                                             \
     NULL,                       /* set_advertisements */      \
     NULL,                       /* get_pt_mode */             \
@@ -4879,4 +4905,168 @@ netdev_dpdk_register(void)
     netdev_register_provider(&dpdk_ring_class);
     netdev_register_provider(&dpdk_vhost_class);
     netdev_register_provider(&dpdk_vhost_client_class);
+}
+
+inline bool
+is_dpdkhw_port(const struct netdev *netdev)
+{
+    return (netdev->netdev_class->flow_put == netdev_dpdk_flow_put);
+}
+
+inline bool
+is_netdev_on_switch(const struct netdev *netdev, const uint16_t switch_id)
+{
+    struct netdev_dpdk *dev = netdev_dpdk_cast(netdev);
+    return (dev->dev_id == switch_id);
+}
+
+/*
+ * Returns valid dpdk_hw netdev for the 'port_no'
+ */
+struct netdev *
+get_hw_netdev(odp_port_t port_no, const struct dpif_class *dpif_class)
+{
+    struct netdev *netdev;
+
+    netdev = netdev_ports_get(port_no, dpif_class);;
+    if(netdev) {
+        /* The port exists, validate if it is hardware accelerated */
+        if (is_dpdkhw_port(netdev)) {
+            /* TODO :: ADD condition to check if netdev can do
+             * either partial/full offload.
+             */
+            return netdev;
+        }
+    }
+    return NULL;
+}
+
+static bool
+del_ufid_to_rteflow_mapping(const ovs_u128 *ufid,
+                            struct netdev_dpdk *dev)
+                            OVS_REQUIRES(dev->dpdkhw_flow_mutex)
+{
+    struct ufid_to_rteflow *data = NULL;
+    size_t hash = hash_bytes(ufid, sizeof *ufid, 0);
+    struct hmap *ufid_to_flow_map = &(dev->ufid_to_flow_map);
+    HMAP_FOR_EACH_WITH_HASH(data, node, hash, ufid_to_flow_map) {
+        if (ovs_u128_equals(*ufid, data->ufid)) {
+            break;
+        }
+    }
+    if(data) {
+        free(data->actions);
+        free(data->hw_flows);
+        hmap_remove(ufid_to_flow_map, &data->node);
+        free(data);
+        return true;
+    }
+    return false;
+}
+
+static void
+delete_all_ufid_to_rteflow_mapping(struct netdev_dpdk *dev)
+                                OVS_REQUIRES(dev->dpdkhw_flow_mutex)
+{
+    struct ufid_to_rteflow *data = NULL;
+    struct hmap *ufid_to_flow_map = &dev->ufid_to_flow_map;
+    HMAP_FOR_EACH(data, node, ufid_to_flow_map) {
+        if (!data) {
+            continue;
+        }
+        free(data->actions);
+        free(data->hw_flows);
+        hmap_remove(ufid_to_flow_map, &data->node);
+        free(data);
+    }
+}
+
+static struct ufid_to_rteflow *
+get_ufid_to_rteflow_mapping__(const ovs_u128 *ufid,
+                            const struct netdev_dpdk *dev)
+                            OVS_REQUIRES(dev->dpdkhw_flow_mutex)
+{
+    struct ufid_to_rteflow *data = NULL;
+    const struct hmap *ufid_to_flow_map = &dev->ufid_to_flow_map;
+    size_t hash = hash_bytes(ufid, sizeof *ufid, 0);
+    HMAP_FOR_EACH_WITH_HASH(data, node, hash, ufid_to_flow_map) {
+        if (ovs_u128_equals(*ufid, data->ufid)) {
+            return data;
+        }
+    }
+    return NULL;
+}
+
+struct ufid_to_rteflow *
+get_ufid_to_rteflow_mapping(const ovs_u128 *ufid,
+                            const struct netdev *netdev)
+{
+    struct netdev_dpdk *dev = netdev_dpdk_cast(netdev);
+    struct ufid_to_rteflow *data = NULL;
+    ovs_mutex_lock(&dev->dpdkhw_flow_mutex);
+    data = get_ufid_to_rteflow_mapping__(ufid, dev);
+    ovs_mutex_unlock(&dev->dpdkhw_flow_mutex);
+    return data;
+}
+
+/*
+ * Add flow mapping, return TRUE when a mapping is exists.
+ * Reture FALSE if new flow is installed.
+ */
+static bool
+add_ufid_to_rteflow_mapping(const ovs_u128 *ufid,
+                            struct netdev_dpdk *dev,
+                            const struct rte_flow *hw_flow,
+                            struct match *match,
+                            const struct nlattr *actions,
+                            const size_t actions_len)
+                            OVS_REQUIRES(dev->dpdkhw_flow_mutex)
+{
+    #define HW_FLOW_BLOCK_SIZE  256
+    size_t hash = hash_bytes(ufid, sizeof *ufid, 0);
+    struct hmap *ufid_to_flow_map = &dev->ufid_to_flow_map;
+    struct ufid_to_rteflow *ufid_to_flow;
+
+    ufid_to_flow = get_ufid_to_rteflow_mapping__(ufid, dev);
+    if (!ufid_to_flow) {
+        /* flow map is not present, add it */
+        ufid_to_flow  = xzalloc(sizeof *ufid_to_flow);
+        ufid_to_flow->netdev = &(dev->up);
+        ufid_to_flow->ufid = *ufid;
+        ufid_to_flow->hw_flows = xzalloc(sizeof (struct rte_flow *) *
+                                         HW_FLOW_BLOCK_SIZE);
+        ufid_to_flow->hw_flow_size_allocated = HW_FLOW_BLOCK_SIZE;
+        ufid_to_flow->hw_flow_size_used = 1;
+        ufid_to_flow->hw_flows[0] = hw_flow;
+        memcpy(&ufid_to_flow->match, match, sizeof *match);
+        ufid_to_flow->actions = xzalloc(actions_len);
+        memcpy(ufid_to_flow->actions, actions, actions_len);
+        ufid_to_flow->action_len = actions_len;
+        hmap_insert(ufid_to_flow_map, &ufid_to_flow->node, hash);
+        return false;
+    }
+    else {
+        if (ufid_to_flow->hw_flow_size_used <
+            ufid_to_flow->hw_flow_size_allocated) {
+            ufid_to_flow->hw_flows[ufid_to_flow->hw_flow_size_used++] =
+                                                    hw_flow;
+        }
+        else {
+            /* Need to reallocate the memory for more flows. */
+            ufid_to_flow->hw_flow_size_allocated += HW_FLOW_BLOCK_SIZE;
+            ufid_to_flow->hw_flows = xrealloc(ufid_to_flow->hw_flows,
+                                     sizeof (struct rte_flow *) *
+                                     ufid_to_flow->hw_flow_size_allocated);
+            ufid_to_flow->hw_flows[ufid_to_flow->hw_flow_size_used++] =
+                                                hw_flow;
+        }
+        return true;
+    }
+}
+
+uint16_t
+netdev_get_dpdk_portno(struct netdev *netdev)
+{
+    struct netdev_dpdk *dev = netdev_dpdk_cast(netdev);
+    return dev->port_id;
 }
