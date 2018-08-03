@@ -137,6 +137,23 @@ struct dpdk_flow_batch {
     uint32_t max_size;
 };
 
+struct ufid_to_rteflow {
+    struct hmap_node node;
+    ovs_u128 ufid;
+    const struct netdev *netdev;
+    /* Based on the hardware capabilities, it is possible to have 1 or many
+     * rte_flow for every ufid. Usually it happen when hardware can only
+     * offload exact match flows and not wc. It is necessary to track them
+     * as well.
+     */
+    const struct rte_flow **hw_flows;
+    uint32_t hw_flow_size_allocated;
+    uint32_t hw_flow_size_used;
+    struct match match; /* The OVS flow entry used to install hw flow */
+    struct nlattr *actions;
+    size_t action_len;
+};
+
 struct dpdkhw_switch;
 /* hardware switch functions. These functions are intended to interact with
  * hardware device.
@@ -215,6 +232,9 @@ extern const struct dpdkhw_switch_fns dpdkhw_full_em_switch_fns;
 bool is_netdev_on_switch(const struct netdev *netdev,
                          const uint16_t switch_id);
 
+struct ufid_to_rteflow;
+struct ufid_to_rteflow *get_ufid_to_rteflow_mapping(const ovs_u128 *ufid,
+                            const struct netdev *netdev);
 extern char hw_switch_flow_install_err_str[][FLOW_INSTALL_ERR_STR_LEN];
 
 #endif /* LIB_NETDEV_DPDK_HW_H_ */
