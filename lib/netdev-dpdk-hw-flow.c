@@ -1084,3 +1084,34 @@ dpdkhw_rte_flow_action_cleanup(struct rte_flow_item hw_flow_batch[],
     }
     return 0;
 }
+
+static void
+update_hw_switch_on_flowadd(struct dpdkhw_switch *hw_switch)
+{
+    atomic_count_inc(&hw_switch->n_flow_cnt);
+}
+
+static struct rte_flow *
+install_ovs_flow_in_hw(struct netdev *netdev, struct dpdkhw_switch *hw_switch,
+                       const struct rte_flow_attr *hw_flow_attr,
+                       struct rte_flow_item *hw_flow_batch,
+                       struct rte_flow_action *hw_action_batch,
+                       struct rte_flow_error *hw_err)
+{
+
+    uint16_t dpdk_portno = netdev_get_dpdk_portno(netdev);
+    struct rte_flow *hw_flow = rte_flow_create(dpdk_portno, hw_flow_attr,
+                                               hw_flow_batch, hw_action_batch,
+                                               hw_err);
+    dpdkhw_rte_flow_action_cleanup(hw_flow_batch, hw_action_batch);
+    if (hw_err->type != RTE_FLOW_ERROR_TYPE_NONE) {
+        /* Error while installing the flow */
+        VLOG_ERR("Failed to install a flow(error : %u)", hw_err->type);
+        hw_flow = NULL;
+    }
+    if (hw_flow) {
+        /* update the hardware switch only when flow is installed */
+        update_hw_switch_on_flowadd(hw_switch);
+    }
+    return hw_flow;
+}
