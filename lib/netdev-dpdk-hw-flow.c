@@ -1385,3 +1385,11 @@ delete_ovs_flow_in_hw(struct netdev *netdev, struct dpdkhw_switch *hw_switch,
     }
     return ret;
 }
+
+const struct dpdkhw_switch_fns dpdkhw_full_em_switch_fns = {
+    is_flow_ofld_on_full_em_switch_supported,
+    dpdkhw_rte_flow_xlate,
+    dpdkhw_em_action_xlate,
+    install_ovs_flow_in_hw,
+    delete_ovs_flow_in_hw
+};
