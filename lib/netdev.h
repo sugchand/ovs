@@ -207,6 +207,10 @@ struct offload_info {
      * it will be in the pkt meta data.
      */
     uint32_t flow_mark;
+    /* Flow put flags enum dpif_flow_put_flags*/
+    uint8_t flow_flags;
+    /* Port map for un-accel ports */
+    uint64_t port_set;
 };
 struct dpif_class;
 struct netdev_flow_dump;
