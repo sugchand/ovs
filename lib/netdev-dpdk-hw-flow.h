@@ -229,6 +229,10 @@ struct netdev *get_hw_netdev(odp_port_t port_no,
                              const struct dpif_class *dpif_class);
 
 extern const struct dpdkhw_switch_fns dpdkhw_full_em_switch_fns;
+int netdev_dpdkhw_switch_flow_del(struct netdev *netdev,
+                                  struct dpdkhw_switch *hw_switch,
+                                  const ovs_u128 *ufid);
+
 bool is_netdev_on_switch(const struct netdev *netdev,
                          const uint16_t switch_id);
 
