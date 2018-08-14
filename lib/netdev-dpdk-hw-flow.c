@@ -34,6 +34,26 @@ enum xlate_status {
     FLOW_XLATE_FAILED = 1<<3
 };
 
+/*
+ * flow install error strings based on the enum set
+ * 'hw_switch_flow_install_err'. Updating the enum must update this string
+ * array as well.
+ */
+char hw_switch_flow_install_err_str[][FLOW_INSTALL_ERR_STR_LEN] =
+{
+    /* FLOW_INSTALL_SUPPORTED */
+    "hardware flow install is supported in the device",
+    /* FLOW_PRESENT_IN_HW */
+    "Flow already present in hardware",
+    /* FLOW_PROTO_UNSUPPORTED */
+    "Flow protocol is unsupported in the hardware",
+    /* FLOW_MAX_LIMIT_REACHED */
+    "Flow max limit for the device is reached",
+    /* FLOW_IN_MULTI_HW */
+    "Flow is span across more than one accelerated device",
+    /* FLOW_WITH_NON_HW_PORTS */
+    "Flow need non hardware accelerated ports"
+};
 
 /* Dictionary entry to translate ovs flow element to rte_flow. */
 struct flow_xlate_dic {
@@ -135,6 +155,214 @@ struct flow_xlate_dic END_FLOW_XLATE = {
         RTE_FLOW_ITEM_TYPE_END,
         do_end_flow_xlate
 };
+
+/* Function to go through each actions to see if it can handle with in the
+ * same device. Also look at the actions to see if its supported in the hw.
+ */
+static enum hw_switch_flow_install_err
+is_action_hanlded_in_one_device(struct dpdkhw_switch *hw_switch,
+                                const struct nlattr *actions,
+                                size_t actions_len,
+                                struct offload_info *ofld_info)
+{
+    const struct nlattr *a;
+    unsigned int left;
+
+    NL_ATTR_FOR_EACH_UNSAFE (a, left, actions, actions_len) {
+        int type = nl_attr_type(a);
+        switch ((enum ovs_action_attr) type) {
+        case OVS_ACTION_ATTR_OUTPUT: {
+            odp_port_t out_port = nl_attr_get_odp_port(a);
+            /* Output port should be hardware port number. */
+            struct netdev *netdev = get_hw_netdev(out_port,
+                                                  ofld_info->dpif_class);
+            if (!netdev) {
+                VLOG_WARN("Cannot find the output port in hw-accel list"
+                          " port %u", odp_to_u32(out_port));
+                return FLOW_WITH_NON_HW_PORTS;
+            }
+            if (!is_netdev_on_switch(netdev, hw_switch->dev_id)) {
+                VLOG_DBG("Output action is not on same device."
+                         "inport device %u ", hw_switch->dev_id);
+                return FLOW_IN_MULTI_HW;
+            }
+            break;
+            }
+        case OVS_ACTION_ATTR_PUSH_VLAN:
+        case OVS_ACTION_ATTR_POP_VLAN:
+        case OVS_ACTION_ATTR_SET:
+        case OVS_ACTION_ATTR_PUSH_MPLS:
+        case OVS_ACTION_ATTR_POP_MPLS:
+        case OVS_ACTION_ATTR_TUNNEL_PUSH:
+        case OVS_ACTION_ATTR_TUNNEL_POP:
+        case OVS_ACTION_ATTR_SET_MASKED:
+        case OVS_ACTION_ATTR_SAMPLE:
+        case OVS_ACTION_ATTR_HASH:
+        case OVS_ACTION_ATTR_UNSPEC:
+        case OVS_ACTION_ATTR_TRUNC:
+        case OVS_ACTION_ATTR_USERSPACE:
+        case OVS_ACTION_ATTR_RECIRC:
+        case OVS_ACTION_ATTR_CT:
+        case OVS_ACTION_ATTR_CT_CLEAR:
+        case OVS_ACTION_ATTR_PUSH_ETH:
+        case OVS_ACTION_ATTR_POP_ETH:
+        case OVS_ACTION_ATTR_PUSH_NSH:
+        case OVS_ACTION_ATTR_POP_NSH:
+        case OVS_ACTION_ATTR_METER:
+        case OVS_ACTION_ATTR_CLONE:
+        case __OVS_ACTION_ATTR_MAX: {
+            break;
+            }
+        default: {
+            break;
+            }
+        }
+        /* TODO :: Validate each actions */
+    }
+    return FLOW_INSTALL_SUPPORTED;
+}
+
+static bool
+is_hw_switch_support_proto(struct dpdkhw_switch *hw_switch,
+                           enum hw_switch_proto switch_proto)
+{
+    if (switch_proto >= LAST_PROTO_INVALID) {
+        VLOG_DBG("Invalid protocol, cannot find in hardware capabilities");
+        return false;
+    }
+    uint8_t flag = 1 << (switch_proto % 8);
+    if (hw_switch->avail_ptypes[switch_proto/8] & flag) {
+        return true;
+    }
+    return false;
+}
+
+static bool
+is_protocol_supported_in_hw(struct dpdkhw_switch *hw_switch,
+                            struct match *match)
+{
+    struct flow *flow = &match->flow;
+    /* Start from the upper layer protocols, L4 layer protocols*/
+    switch(flow->nw_proto) {
+    case IPPROTO_TCP: {
+        return is_hw_switch_support_proto(hw_switch, L4_TCP);
+        break;
+        }
+    case IPPROTO_UDP: {
+        return is_hw_switch_support_proto(hw_switch, L4_UDP);
+        break;
+        }
+    case IPPROTO_ICMP: {
+        return is_hw_switch_support_proto(hw_switch, L4_ICMP);
+        break;
+        }
+    case IPPROTO_SCTP: {
+        return is_hw_switch_support_proto(hw_switch, L4_SCTP);
+        break;
+        }
+    case IPPROTO_ICMPV6: {
+        return is_hw_switch_support_proto(hw_switch, L4_ICMPV6);
+        break;
+        }
+    }
+
+    /* Look for L3 only layer protocols */
+    switch(ntohs(flow->dl_type)) {
+    case ETH_TYPE_ARP: {
+        return is_hw_switch_support_proto(hw_switch, L3_ARP);
+        break;
+        }
+    case ETH_TYPE_RARP: {
+        return is_hw_switch_support_proto(hw_switch, L3_RARP);
+        break;
+        }
+    case ETH_TYPE_IP: {
+        return is_hw_switch_support_proto(hw_switch, L3_IP);
+        break;
+        }
+    case ETH_TYPE_IPV6: {
+        return is_hw_switch_support_proto(hw_switch, L3_IPV6);
+        break;
+        }
+    case ETH_TYPE_VLAN: {
+        return is_hw_switch_support_proto(hw_switch, L3_VLAN);
+        break;
+        }
+    }
+
+    if (!eth_addr_is_zero(flow->dl_dst) && !eth_addr_is_zero(flow->dl_src)) {
+        /* Just a L2 rule */
+        return is_hw_switch_support_proto(hw_switch, L2_ETH);
+    }
+
+    /* TODO :: Add protocols to check support */
+    return false;
+}
+
+/*
+ * Function to check if a flow is already present in the hw before installing
+ */
+static inline bool
+is_flow_present_in_hw(struct netdev *netdev, const ovs_u128 *ufid,
+                      const struct nlattr *actions,
+                      size_t actions_len)
+{
+    struct ufid_to_rteflow *entry;
+    entry = get_ufid_to_rteflow_mapping(ufid, netdev);
+    if (entry) {
+        if (entry->action_len != actions_len) {
+            /* Drop action can have zero len, so
+             * check action_len to see if a flow need to be modified
+             * in hw
+             */
+            return false;
+        }
+        if (!memcmp(entry->actions, actions, actions_len)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static enum hw_switch_flow_install_err
+is_flow_ofld_on_full_em_switch_supported(struct netdev *netdev,
+                                         struct dpdkhw_switch *hw_switch,
+                                         struct match *match,
+                                         const struct nlattr *actions,
+                                         size_t actions_len,
+                                         const ovs_u128 *ufid,
+                                         struct offload_info *info)
+{
+    /* hardware doesnt have flow modify support, hence first delete the flow
+     * before trying the flow install.
+     * Modify with drop action is used as a delete function by revalidator.
+     */
+    if (info->flow_flags & DPIF_FP_MODIFY) {
+        if (is_flow_present_in_hw(netdev, ufid, actions, actions_len)) {
+            /*
+             * No need to modify the flow in hw as its same as in sw.
+             */
+            return FLOW_PRESENT_IN_HW;
+        }
+        VLOG_DBG("Deleteing flows when modifying existing flows.");
+        netdev_dpdkhw_switch_flow_del(netdev, hw_switch, ufid);
+    }
+
+    /* Check if the flow count before the install */
+    if (atomic_count_get(&hw_switch->n_flow_cnt) >=
+        hw_switch->total_flow_cnt) {
+        return FLOW_MAX_LIMIT_REACHED;
+    }
+
+    /* Check if flow types are supported in the switch */
+    if (!is_protocol_supported_in_hw(hw_switch, match)) {
+        return FLOW_PROTO_UNSUPPORTED;
+    }
+
+    /* Check if the actions has port output, make sure its in same device */
+    return is_action_hanlded_in_one_device(hw_switch, actions,
+                                           actions_len, info);
+}
 
 static enum xlate_status
 do_inport_flow_xlate(struct match *match, struct dpdk_flow_batch *batch,
