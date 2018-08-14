@@ -1051,3 +1051,36 @@ dpdkhw_em_action_xlate(struct rte_flow_action hw_action_batch[],
     hw_action_batch[i].conf =  NULL;
     return ret;
 }
+
+/*
+ * Cleanup the rte flow allocated resource after the flow getting installed in hw
+ */
+static int
+dpdkhw_rte_flow_action_cleanup(struct rte_flow_item hw_flow_batch[],
+                               struct rte_flow_action hw_action_batch[])
+{
+    struct rte_flow_item *flow_item;
+    struct rte_flow_action *action_item;
+    int idx;
+
+    FOR_EACH_HWITEM(hw_flow_batch, flow_item, MAX_DPDKHW_RTE_FLOW_SIZE,
+                    RTE_FLOW_ITEM_TYPE_END, idx) {
+        if(flow_item->spec) {
+            free((void *)flow_item->spec);
+        }
+        if(flow_item->mask) {
+            free((void *)flow_item->mask);
+        }
+        if(flow_item->last) {
+            free((void *)flow_item->last);
+        }
+    }
+
+    FOR_EACH_HWITEM(hw_action_batch, action_item, MAX_DPDKHW_RTE_ACTION_SIZE,
+                    RTE_FLOW_ACTION_TYPE_END, idx) {
+        if(action_item->conf) {
+            free((void *)action_item->conf);
+        }
+    }
+    return 0;
+}
